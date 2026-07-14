@@ -1,4 +1,5 @@
-from flask import Flask, render_template, request, redirect, url_for, flash, Response, session
+from flask import Flask, render_template, request, redirect, url_for, flash, Response, session, jsonify
+from flask_cors import CORS
 import smtplib
 from email.mime.text import MIMEText
 import socket
@@ -9,12 +10,21 @@ app = Flask(__name__)
 app.secret_key = 'kunci_rahasia_jaringan_komputer'
 
 # =========================================================================
+# KONFIGURASI CORS & COOKIE CROSS-ORIGIN
+# =========================================================================
+# Izinkan frontend lokal (127.0.0.1:8080) mengakses backend ini dengan cookie
+CORS(app, supports_credentials=True, origins=["http://127.0.0.1:8080"])
+
+app.config['SESSION_COOKIE_SAMESITE'] = 'None'
+app.config['SESSION_COOKIE_SECURE'] = True  # wajib True karena backend diakses via HTTPS
+
+# =========================================================================
 # KONFIGURASI EMAIL
 # =========================================================================
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 EMAIL_SENDER = "willymin783@gmail.com"
-EMAIL_PASSWORD = "akfj pywy ryab snih" # Ganti dengan App Password Gmail Anda
+EMAIL_PASSWORD = "akfj pywy ryab snih"  # Ganti dengan App Password Gmail Anda
 
 def kirim_email_verifikasi(email_tujuan):
     isi_email = "Halo,\n\nTerima kasih telah mendaftar di Aplikasi Jaringan Web kami. Akun Anda berhasil dibuat dan sudah dapat digunakan untuk login."
@@ -42,72 +52,55 @@ def get_db_connection():
     return conn
 
 # =========================================================================
-# ROUTING LOGIN, REGISTRASI & LOGOUT
+# ROUTING LOGIN, REGISTRASI & LOGOUT (JSON API untuk frontend lokal)
 # =========================================================================
 
-@app.route('/', methods=['GET', 'POST'])
+@app.route('/login', methods=['POST'])
 def login():
-    # Jika user sudah login, langsung arahkan ke dashboard
-    if 'user_email' in session:
-        return redirect(url_for('dashboard'))
+    email = request.form.get('email')
+    password = request.form.get('password')
 
-    if request.method == 'POST':
-        email = request.form['email']
-        password = request.form['password']
-        
-        conn = get_db_connection()
-        user = conn.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
+    if not email or not password:
+        return jsonify(success=False, message="Email dan password wajib diisi."), 400
+
+    conn = get_db_connection()
+    user = conn.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
+    conn.close()
+
+    if user and check_password_hash(user['password'], password):
+        session['user_email'] = email
+        return jsonify(success=True, message="Login berhasil.", email=email)
+    else:
+        return jsonify(success=False, message="Email tidak ditemukan atau password salah."), 401
+
+
+@app.route('/register', methods=['POST'])
+def register():
+    email = request.form.get('email')
+    password = request.form.get('password')
+
+    if not email or not password:
+        return jsonify(success=False, message="Email dan password wajib diisi."), 400
+
+    hashed_password = generate_password_hash(password)
+
+    conn = get_db_connection()
+    try:
+        conn.execute('INSERT INTO users (email, password) VALUES (?, ?)', (email, hashed_password))
+        conn.commit()
+        kirim_email_verifikasi(email)
+        return jsonify(success=True, message="Registrasi sukses!")
+    except sqlite3.IntegrityError:
+        return jsonify(success=False, message="Email tersebut sudah terdaftar! Gunakan email lain atau silakan login."), 409
+    finally:
         conn.close()
 
-        # Cek apakah user ada DAN passwordnya cocok
-        if user and check_password_hash(user['password'], password):
-            # Simpan sesi login
-            session['user_email'] = email
-            return redirect(url_for('dashboard'))
-        else:
-            flash('Login gagal! Email tidak ditemukan atau password salah.')
-            
-    return render_template('login.html')
 
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    if request.method == 'POST':
-        email = request.form['email']
-        password = request.form['password']
-        
-        hashed_password = generate_password_hash(password)
-        
-        conn = get_db_connection()
-        try:
-            conn.execute('INSERT INTO users (email, password) VALUES (?, ?)', (email, hashed_password))
-            conn.commit()
-            
-            kirim_email_verifikasi(email)
-            flash('Registrasi sukses! Silakan periksa email Anda dan lakukan login.')
-            return redirect(url_for('login'))
-        except sqlite3.IntegrityError:
-            flash('Email tersebut sudah terdaftar! Gunakan email lain atau silakan login.')
-        finally:
-            conn.close()
-            
-    return render_template('register.html')
-
-@app.route('/logout')
+@app.route('/logout', methods=['POST'])
 def logout():
-    # Hapus data sesi pengguna saat ini
     session.pop('user_email', None)
-    flash('Anda telah berhasil keluar (Logout).')
-    return redirect(url_for('login'))
+    return jsonify(success=True, message="Anda telah berhasil keluar (Logout).")
 
-@app.route('/dashboard')
-def dashboard():
-    # Cek apakah user sudah login, jika belum kembalikan ke halaman login
-    if 'user_email' not in session:
-        flash('Silakan login terlebih dahulu untuk mengakses Dashboard.')
-        return redirect(url_for('login'))
-    
-    # Kirim data email user yang sedang login ke template html
-    return render_template('dashboard.html', user_email=session['user_email'])
 
 # =========================================================================
 # INTERFACES JALUR TCP UPLOAD (AJAX)
@@ -115,13 +108,15 @@ def dashboard():
 @app.route('/upload', methods=['POST'])
 def upload_file():
     if 'user_email' not in session:
-        return "Akses Ditolak", 403
+        return jsonify(success=False, message="Akses ditolak, silakan login."), 403
 
     if 'file' not in request.files:
-        return "Tidak ada file", 400
+        return jsonify(success=False, message="Tidak ada file."), 400
+
     file = request.files['file']
     if file.filename == '':
-        return "Nama file tidak valid", 400
+        return jsonify(success=False, message="Nama file tidak valid."), 400
+
     file_data = file.read()
     try:
         tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -138,7 +133,6 @@ def upload_file():
 # =========================================================================
 def dapatkan_frame_udp():
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    # Gunakan SO_REUSEADDR agar port tidak nyangkut saat restart
     udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     udp_sock.bind(('127.0.0.1', 9002))
     while True:
